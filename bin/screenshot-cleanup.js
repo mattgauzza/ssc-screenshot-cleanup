@@ -294,21 +294,27 @@ function extractFirstJson(text) {
   try {
     return JSON.parse(trimmed);
   } catch (_) {
-    // Continue and try first JSON object.
+    // Continue and try embedded JSON objects.
   }
-  const start = trimmed.indexOf("{");
-  if (start < 0) return null;
-  let depth = 0;
-  for (let i = start; i < trimmed.length; i += 1) {
-    const ch = trimmed[i];
-    if (ch === "{") depth += 1;
-    if (ch === "}") depth -= 1;
-    if (depth === 0) {
-      const candidate = trimmed.slice(start, i + 1);
-      try {
-        return JSON.parse(candidate);
-      } catch (_) {
-        return null;
+
+  // Scan for the first parsable JSON object; skip malformed brace blocks.
+  for (let start = 0; start < trimmed.length; start += 1) {
+    if (trimmed[start] !== "{") continue;
+    let depth = 0;
+    for (let i = start; i < trimmed.length; i += 1) {
+      const ch = trimmed[i];
+      if (ch === "{") depth += 1;
+      if (ch === "}") {
+        depth -= 1;
+        if (depth < 0) break;
+      }
+      if (depth === 0) {
+        const candidate = trimmed.slice(start, i + 1);
+        try {
+          return JSON.parse(candidate);
+        } catch (_) {
+          break;
+        }
       }
     }
   }
