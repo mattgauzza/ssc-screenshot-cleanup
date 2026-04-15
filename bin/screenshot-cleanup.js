@@ -8,7 +8,7 @@ const { spawn } = require("child_process");
 const readline = require("readline");
 
 const APP_NAME = "screenshot-cleanup";
-const WINDOWS_DEFAULT_FOLDER = "C:\\Users\\matt\\Pictures\\Screenshots";
+const WINDOWS_DEFAULT_FOLDER = path.join(os.homedir(), "Pictures", "Screenshots");
 const DEFAULT_EXTENSIONS = [".png", ".jpg", ".jpeg", ".webp", ".bmp"];
 
 const DEFAULT_CONFIG = {
@@ -36,10 +36,10 @@ const DEFAULT_CONFIG = {
         "{model}",
         "--image",
         "{image}",
-        "--json",
-        "{prompt}"
+        "-"
       ],
       model: "gpt-4.1-mini",
+      promptMode: "stdin",
       outputJsonPath: ""
     },
     copilot: {
@@ -139,7 +139,7 @@ function printHelp() {
   ssc help
 
 Notes:
-  - Default Windows folder: C:\\Users\\matt\\Pictures\\Screenshots
+  - Default Windows folder: C:\\Users\\<you>\\Pictures\\Screenshots
   - Configure provider command/args in config to match your local Codex/Copilot CLI syntax.
   - Results are cached by file path + mtime + size to minimize repeated model requests.`);
 }
@@ -340,14 +340,16 @@ async function runProvider(config, providerName, model, imagePath, prompt, verbo
     image: imagePath,
     prompt
   });
+  const promptMode = provider.promptMode === "stdin" ? "stdin" : "arg";
 
   if (verbose) {
     console.log(`provider cmd: ${provider.command} ${finalArgs.join(" ")}`);
   }
 
+  const useShell = /\.(cmd|bat|ps1)$/i.test(String(provider.command || ""));
   const child = spawn(provider.command, finalArgs, {
-    stdio: ["ignore", "pipe", "pipe"],
-    shell: false
+    stdio: ["pipe", "pipe", "pipe"],
+    shell: useShell
   });
 
   let stdout = "";
@@ -358,6 +360,13 @@ async function runProvider(config, providerName, model, imagePath, prompt, verbo
   child.stderr.on("data", (chunk) => {
     stderr += chunk.toString();
   });
+
+  if (promptMode === "stdin") {
+    child.stdin.write(prompt);
+    child.stdin.end();
+  } else {
+    child.stdin.end();
+  }
 
   const waitForExit = new Promise((resolve, reject) => {
     child.on("error", reject);
@@ -439,11 +448,23 @@ function normalizeTarget(value, fallback) {
   return fallback;
 }
 
+function normalizeTargetWithAllowed(value, fallback, allowed) {
+  const v = normalizeTarget(value, fallback);
+  if (!Array.isArray(allowed) || !allowed.length) return v;
+  return allowed.includes(v) ? v : fallback;
+}
+
 function normalizeProvider(value, fallback) {
   const v = String(value || "").trim().toLowerCase();
   if (!v) return fallback;
   if (v === "codex" || v === "copilot") return v;
   return fallback;
+}
+
+function normalizeProviderWithAllowed(value, fallback, allowed) {
+  const v = normalizeProvider(value, fallback);
+  if (!Array.isArray(allowed) || !allowed.length) return v;
+  return allowed.includes(v) ? v : fallback;
 }
 
 function normalizeSort(value, fallback) {
@@ -477,15 +498,57 @@ function parseNumberInput(value, fallback, minValue) {
   return num;
 }
 
+function clampNumber(value, min, max) {
+  if (!Number.isFinite(value)) return value;
+  return Math.min(max, Math.max(min, value));
+}
+
 function askQuestion(rl, prompt) {
   return new Promise((resolve) => {
     rl.question(prompt, (answer) => resolve(answer));
   });
 }
 
+function commandExists(command) {
+  return new Promise((resolve) => {
+    const checker = process.platform === "win32" ? "where" : "which";
+    const child = spawn(checker, [command], { stdio: "ignore", shell: false });
+    child.on("error", () => resolve(false));
+    child.on("close", (code) => resolve(code === 0));
+  });
+}
+
+async function detectAvailableInstallTargets() {
+  const hasCodex = await commandExists("codex");
+  const hasCopilot = await commandExists("copilot");
+  if (hasCodex && hasCopilot) {
+    return {
+      hasCodex,
+      hasCopilot,
+      targets: ["codex", "copilot", "both"],
+      providers: ["codex", "copilot"]
+    };
+  }
+  if (hasCodex) {
+    return { hasCodex, hasCopilot, targets: ["codex"], providers: ["codex"] };
+  }
+  if (hasCopilot) {
+    return { hasCodex, hasCopilot, targets: ["copilot"], providers: ["copilot"] };
+  }
+  return {
+    hasCodex,
+    hasCopilot,
+    targets: ["codex", "copilot", "both"],
+    providers: ["codex", "copilot"]
+  };
+}
+
 async function runInstallWizard(configPath, config, args) {
   const installer = config.installer || {};
   const daily = config.daily || {};
+  const detected = await detectAvailableInstallTargets();
+  const availableTargets = detected.targets;
+  const availableProviders = detected.providers;
   const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout
@@ -494,12 +557,17 @@ async function runInstallWizard(configPath, config, args) {
     console.log("ScreenShotCleanup interactive install");
     console.log("Press Enter to accept defaults.");
 
-    const defaultTarget = normalizeTarget(args.target, normalizeTarget(installer.installTarget, "codex"));
+    const defaultTarget = normalizeTargetWithAllowed(
+      args.target,
+      normalizeTargetWithAllowed(installer.installTarget, availableTargets[0] || "codex", availableTargets),
+      availableTargets
+    );
+    const targetOptionsText = availableTargets.join("|");
     const targetAnswer = await askQuestion(
       rl,
-      `What CLI do you want to use (default: ${defaultTarget}, options: codex|copilot|both)? `
+      `What CLI do you want to use (default: ${defaultTarget}, options: ${targetOptionsText})? `
     );
-    const target = normalizeTarget(targetAnswer, defaultTarget);
+    const target = normalizeTargetWithAllowed(targetAnswer, defaultTarget, availableTargets);
 
     const defaultFolder = String(config.defaultFolder || WINDOWS_DEFAULT_FOLDER);
     const folderAnswer = await askQuestion(
@@ -532,12 +600,13 @@ async function runInstallWizard(configPath, config, args) {
       installer.copilotDir = copilotAnswer.trim() ? path.resolve(copilotAnswer.trim()) : copilotDefault;
     }
 
-    const providerDefault = normalizeProvider(config.provider, "codex");
+    const providerDefault = normalizeProviderWithAllowed(config.provider, availableProviders[0] || "codex", availableProviders);
+    const providerOptionsText = availableProviders.join("|");
     const providerAnswer = await askQuestion(
       rl,
-      `Classification provider (default: ${providerDefault}, options: codex|copilot): `
+      `Classification provider (default: ${providerDefault}, options: ${providerOptionsText}): `
     );
-    config.provider = normalizeProvider(providerAnswer, providerDefault);
+    config.provider = normalizeProviderWithAllowed(providerAnswer, providerDefault, availableProviders);
 
     const modelDefault = String(config.providers?.[config.provider]?.model || "");
     const modelAnswer = await askQuestion(
@@ -547,6 +616,14 @@ async function runInstallWizard(configPath, config, args) {
     if (modelAnswer.trim()) {
       config.providers[config.provider].model = modelAnswer.trim();
     }
+
+    const thresholdDefault = toNumber(config.importanceThreshold, 0.65);
+    const thresholdAnswer = await askQuestion(
+      rl,
+      `Importance threshold 0-1 (default: ${thresholdDefault}): `
+    );
+    const parsedThreshold = parseNumberInput(thresholdAnswer, thresholdDefault, 0);
+    config.importanceThreshold = clampNumber(parsedThreshold, 0, 1);
 
     const dailyEnabledDefault = Boolean(daily.enabled);
     const dailyEnabledAnswer = await askQuestion(

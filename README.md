@@ -2,11 +2,19 @@
 
 `ssc` is a Windows-friendly CLI that classifies screenshots as important vs disposable, then cleans up low-value images with strict daily budgets to keep model/token usage low.
 
+## About This Project
+
+Not sure about you, but after using coding CLIs for a while I end up with thousands of screenshots.
+
+I do not want to clean those up manually, and you probably do not either.
+
+Let the CLIs do it. Install ScreenShotCleanup.
+
 ## Features
 
 - Interactive setup: `ssc --install`
 - Interactive uninstall: `ssc --uninstall`
-- Default screenshot folder on Windows: `C:\Users\matt\Pictures\Screenshots`
+- Default screenshot folder on Windows: `C:\Users\<you>\Pictures\Screenshots`
 - Daily budgets:
   - max model calls/day
   - max cleanup actions/day
@@ -80,10 +88,11 @@ ssc --install
 
 The wizard asks for:
 
-- target CLI: `codex`, `copilot`, or `both`
+- target CLI (auto-detected from installed CLIs)
 - screenshot folder
 - install directories (`~/.codex`, `~/.copilot` by default)
 - provider + model
+- importance threshold (`0-1`)
 - daily budget settings
 - cleanup strategy (`oldest`/`newest`, `report`/`move`/`delete`)
 
@@ -160,8 +169,8 @@ Default behavior:
 
 `ssc --install` creates script shims in your configured CLI folders, for example:
 
-- `C:\Users\matt\.codex\screenshot-cleanup-daily-codex.cmd`
-- `C:\Users\matt\.copilot\screenshot-cleanup-daily-copilot.cmd`
+- `C:\Users\<you>\.codex\screenshot-cleanup-daily-codex.cmd`
+- `C:\Users\<you>\.copilot\screenshot-cleanup-daily-copilot.cmd`
 
 If your Codex/Copilot tooling supports pre-send or post-send hooks, point those hooks to the generated `.cmd` scripts.
 
