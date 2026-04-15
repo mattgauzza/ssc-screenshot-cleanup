@@ -17,17 +17,23 @@
 
 ## Install
 
-### From npm (recommended once published)
+### From GitHub (current recommended)
 
 ```powershell
-npm install -g ssc-screenshot-cleanup
+npm install -g github:mattgauzza/ssc-screenshot-cleanup
 ssc --install
 ```
 
-### From GitHub repo
+### Run without global install
 
 ```powershell
-npm install -g github:<your-github-username>/ssc-screenshot-cleanup
+npx github:mattgauzza/ssc-screenshot-cleanup --install
+```
+
+### From npm (when published)
+
+```powershell
+npm install -g ssc-screenshot-cleanup
 ssc --install
 ```
 
@@ -50,6 +56,19 @@ ssc run-daily
 ```
 
 `ssc run` is report-focused unless you explicitly choose cleanup actions.
+
+## First Run (Copy/Paste)
+
+```powershell
+npm install -g github:mattgauzza/ssc-screenshot-cleanup
+ssc --install
+ssc run-daily
+```
+
+After `ssc --install`, your helper scripts are generated in:
+
+- `C:\Users\<you>\.codex`
+- `C:\Users\<you>\.copilot`
 
 ## Interactive Setup
 
@@ -172,6 +191,11 @@ gh repo create ssc-screenshot-cleanup --public --source . --remote origin --push
 npm login
 npm publish --access public
 ```
+
+Current status:
+
+- GitHub install is available now.
+- npm package install (`npm i -g ssc-screenshot-cleanup`) works after npm publish.
 
 After publish, users install with:
 
