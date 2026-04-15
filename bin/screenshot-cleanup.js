@@ -32,6 +32,7 @@ const DEFAULT_CONFIG = {
       command: "codex",
       args: [
         "exec",
+        "--dangerously-bypass-approvals-and-sandbox",
         "--model",
         "{model}",
         "--image",
@@ -47,6 +48,7 @@ const DEFAULT_CONFIG = {
       command: "copilot",
       args: [
         "chat",
+        "--yolo",
         "--model",
         "{model}",
         "--image",
@@ -353,39 +355,72 @@ async function runProvider(config, providerName, model, imagePath, prompt, verbo
   }
 
   const useShell = /\.(cmd|bat|ps1)$/i.test(String(provider.command || ""));
-  const child = spawn(provider.command, finalArgs, {
-    stdio: ["pipe", "pipe", "pipe"],
-    shell: useShell
-  });
+  const runOnce = (args) => {
+    const child = spawn(provider.command, args, {
+      stdio: ["pipe", "pipe", "pipe"],
+      shell: useShell
+    });
 
-  let stdout = "";
-  let stderr = "";
-  child.stdout.on("data", (chunk) => {
-    stdout += chunk.toString();
-  });
-  child.stderr.on("data", (chunk) => {
-    stderr += chunk.toString();
-  });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
 
-  if (promptMode === "stdin") {
-    child.stdin.write(prompt);
-    child.stdin.end();
-  } else {
-    child.stdin.end();
+    if (promptMode === "stdin") {
+      child.stdin.write(prompt);
+      child.stdin.end();
+    } else {
+      child.stdin.end();
+    }
+
+    const waitForExit = new Promise((resolve, reject) => {
+      child.on("error", reject);
+      child.on("close", (code) => {
+        if (code !== 0) {
+          reject(new Error(`Provider exited with code ${code}: ${stderr.trim() || "no stderr"}`));
+          return;
+        }
+        resolve({ stdout, stderr });
+      });
+    });
+
+    return Promise.race([waitForExit, withTimeout(child, config.requestTimeoutMs)]);
+  };
+
+  function withCodexSkipRepoCheck(args) {
+    const next = Array.isArray(args) ? [...args] : [];
+    if (next.includes("--skip-git-repo-check")) return next;
+    const execIndex = next.findIndex((x) => String(x).toLowerCase() === "exec");
+    if (execIndex >= 0) {
+      next.splice(execIndex + 1, 0, "--skip-git-repo-check");
+      return next;
+    }
+    next.unshift("--skip-git-repo-check");
+    return next;
   }
 
-  const waitForExit = new Promise((resolve, reject) => {
-    child.on("error", reject);
-    child.on("close", (code) => {
-      if (code !== 0) {
-        reject(new Error(`Provider exited with code ${code}: ${stderr.trim() || "no stderr"}`));
-        return;
-      }
-      resolve();
-    });
-  });
-
-  await Promise.race([waitForExit, withTimeout(child, config.requestTimeoutMs)]);
+  let stdout = "";
+  try {
+    const res = await runOnce(finalArgs);
+    stdout = res.stdout;
+  } catch (error) {
+    const commandLower = String(provider.command || "").toLowerCase();
+    const canRetryForTrustCheck =
+      (providerName === "codex" || commandLower.includes("codex")) &&
+      String(error?.message || "").toLowerCase().includes("not inside a trusted directory");
+    if (!canRetryForTrustCheck) throw error;
+    const retryArgs = withCodexSkipRepoCheck(finalArgs);
+    if (verbose) {
+      console.log("provider retry: adding --skip-git-repo-check");
+      console.log(`provider cmd: ${provider.command} ${retryArgs.join(" ")}`);
+    }
+    const res = await runOnce(retryArgs);
+    stdout = res.stdout;
+  }
   const parsed = extractFirstJson(stdout);
   if (!parsed) {
     throw new Error(`Could not parse JSON from provider output: ${stdout.slice(0, 400)}`);
