@@ -6,17 +6,9 @@
 
 Not sure about you, but after using coding CLIs for a while I end up with thousands of screenshots.
 
-I do not want to clean those up manually, and you probably do not either.
-
-Let the CLIs do it. Install ScreenShotCleanup.
-
-## Screenshots
-
-### Screenshot Folder Example
-
 ![Screenshots folder with item count](./assets/readme/screenshots-folder.png)
 
-### CLI All The Things
+I ain't cleaning all that up myself. Let the CLIs do it! Install ScreenShotCleanup.
 
 ![CLI all the things meme](./assets/readme/cli-all-the-things.jpg)
 
