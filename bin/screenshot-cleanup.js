@@ -6,6 +6,7 @@ const path = require("path");
 const os = require("os");
 const { spawn } = require("child_process");
 const readline = require("readline");
+const { pathToFileURL } = require("url");
 
 const APP_NAME = "screenshot-cleanup";
 const WINDOWS_DEFAULT_FOLDER = path.join(os.homedir(), "Pictures", "Screenshots");
@@ -96,6 +97,77 @@ const DEFAULT_CONFIG = {
   }
 };
 
+const ANSI = {
+  reset: "\x1b[0m",
+  bold: "\x1b[1m",
+  dim: "\x1b[2m",
+  red: "\x1b[31m",
+  green: "\x1b[32m",
+  yellow: "\x1b[33m",
+  blue: "\x1b[34m",
+  cyan: "\x1b[36m"
+};
+
+function supportsColor() {
+  if (process.env.NO_COLOR) return false;
+  const force = String(process.env.FORCE_COLOR || "").trim();
+  if (force === "0") return false;
+  if (force) return true;
+  if (!process.stdout || !process.stdout.isTTY) return false;
+  if (process.platform !== "win32") return true;
+  return Boolean(
+    process.env.WT_SESSION ||
+      process.env.ANSICON ||
+      process.env.ConEmuANSI === "ON" ||
+      String(process.env.TERM_PROGRAM || "").toLowerCase().includes("vscode")
+  );
+}
+
+function paint(text, colorCode) {
+  if (!supportsColor()) return String(text);
+  return `${colorCode}${text}${ANSI.reset}`;
+}
+
+function labelInfo(text) {
+  return paint(text, ANSI.cyan);
+}
+
+function labelOk(text) {
+  return paint(text, ANSI.green);
+}
+
+function labelWarn(text) {
+  return paint(text, ANSI.yellow);
+}
+
+function labelErr(text) {
+  return paint(text, ANSI.red);
+}
+
+function labelDim(text) {
+  return paint(text, ANSI.dim);
+}
+
+function formatProviderCmdArgsForDisplay(args) {
+  const out = [];
+  let hideNext = false;
+  for (const arg of args) {
+    if (hideNext) {
+      out.push("<prompt>");
+      hideNext = false;
+      continue;
+    }
+    const token = String(arg);
+    if (token === "-p" || token === "--prompt") {
+      out.push(token);
+      hideNext = true;
+      continue;
+    }
+    out.push(token);
+  }
+  return out;
+}
+
 function parseArgs(argv) {
   const args = { _: [] };
   for (let i = 0; i < argv.length; i += 1) {
@@ -119,17 +191,24 @@ function parseArgs(argv) {
   return args;
 }
 
-function printHelp() {
+async function printHelp(configPath) {
+  const config = await loadConfig(configPath);
   console.log(`Usage:
   ssc --install
   ssc --uninstall
   ssc init [--config <path>]
   ssc run [folder] [--provider codex|copilot] [--model <name>] [--action report|move|delete]
           [--max-files <n>] [--min-size-kb <n>] [--threshold <0-1>] [--concurrency <n>]
-          [--oldest-first|--newest-first]
+          [--oldest-first|--newest-first] [--aggressive]
           [--force] [--yes] [--verbose] [--config <path>]
   ssc run-daily [folder] [--provider codex|copilot] [--model <name>] [--action report|move|delete]
-                [--max-files <n>] [--oldest-first|--newest-first] [--verbose] [--config <path>]
+                [--max-files <n>] [--oldest-first|--newest-first] [--aggressive] [--verbose] [--config <path>]
+  ssc schedule install [--time <HH:mm>] [--task-name <name>] [--folder <path>]
+                       [--provider codex|copilot] [--model <name>] [--action report|move|delete]
+                       [--max-files <n>] [--oldest-first|--newest-first] [--aggressive] [--verbose] [--config <path>]
+  ssc schedule status [--task-name <name>]
+  ssc schedule run-now [--task-name <name>]
+  ssc schedule uninstall [--task-name <name>]
   ssc install [--target codex|copilot|both]
               [--codex-dir <path>] [--copilot-dir <path>]
               [--script-name <name>] [--force] [--no-prompt] [--config <path>]
@@ -143,7 +222,10 @@ function printHelp() {
 Notes:
   - Default Windows folder: C:\\Users\\<you>\\Pictures\\Screenshots
   - Configure provider command/args in config to match your local Codex/Copilot CLI syntax.
-  - Results are cached by file path + mtime + size to minimize repeated model requests.`);
+  - Results are cached by file path + mtime + size to minimize repeated model requests.
+
+Current effective config (${configPath}):
+${JSON.stringify(config, null, 2)}`);
 }
 
 function parsePrimitive(value) {
@@ -181,6 +263,10 @@ function getCachePath(configPath) {
 
 function getDailyStatePath(configPath) {
   return path.join(path.dirname(configPath), "daily-state.json");
+}
+
+function getDefaultScheduleTaskName() {
+  return "SSC Screenshot Cleanup Daily";
 }
 
 function mergeConfig(base, override) {
@@ -283,7 +369,25 @@ function fillTemplate(tokens, values) {
 function withTimeout(child, timeoutMs) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
-      child.kill("SIGKILL");
+      if (process.platform === "win32" && child.pid) {
+        const killer = spawn("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], {
+          stdio: "ignore",
+          windowsHide: true
+        });
+        killer.on("error", () => {
+          try {
+            child.kill("SIGKILL");
+          } catch (_) {
+            // best-effort only
+          }
+        });
+      } else {
+        try {
+          child.kill("SIGKILL");
+        } catch (_) {
+          // best-effort only
+        }
+      }
       reject(new Error(`Provider timeout after ${timeoutMs}ms`));
     }, timeoutMs);
     child.once("exit", () => clearTimeout(timer));
@@ -323,6 +427,124 @@ function extractFirstJson(text) {
   return null;
 }
 
+function extractCopilotAssistantJson(stdout) {
+  const lines = String(stdout || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  let lastAssistantContent = "";
+  for (const line of lines) {
+    if (!line.startsWith("{")) continue;
+    try {
+      const evt = JSON.parse(line);
+      if (evt?.type === "assistant.message" && typeof evt?.data?.content === "string") {
+        lastAssistantContent = evt.data.content;
+      }
+    } catch (_) {
+      // ignore non-JSON lines
+    }
+  }
+  if (!lastAssistantContent) return null;
+  return extractFirstJson(lastAssistantContent);
+}
+
+function heuristicClassificationFromText(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return null;
+  const lower = raw.toLowerCase();
+  const attachmentMissing =
+    lower.includes("no screenshot attached") ||
+    lower.includes("no screenshot") ||
+    lower.includes("no image attached") ||
+    lower.includes("no image provided") ||
+    lower.includes("don't see a screenshot attached") ||
+    lower.includes("message was cut off") ||
+    lower.includes("message was truncated") ||
+    lower.includes("message may be incomplete");
+  if (attachmentMissing) {
+    return null;
+  }
+  const looksLikeToolTrace =
+    lower.includes("search (glob)") ||
+    lower.includes("list directory") ||
+    lower.includes("toolrequests") ||
+    lower.includes("\"type\":\"assistant.message_delta\"") ||
+    lower.includes("\"type\":\"assistant.message\"");
+  if (looksLikeToolTrace) {
+    return null;
+  }
+  const strongKeep =
+    lower.includes("receipt") ||
+    lower.includes("invoice") ||
+    lower.includes("error") ||
+    lower.includes("stack trace") ||
+    lower.includes("policy") ||
+    lower.includes("rejection notice") ||
+    lower.includes("transaction") ||
+    lower.includes("confirmation");
+  const disposableSignals =
+    lower.includes("temporary") ||
+    lower.includes("ui state") ||
+    lower.includes("low-value") ||
+    lower.includes("accidental") ||
+    lower.includes("duplicate");
+  const important = strongKeep ? true : disposableSignals ? false : true;
+  const confidence = strongKeep || disposableSignals ? 0.7 : 0.3;
+  const reason = raw.slice(0, 120) || (important ? "Heuristic keep from provider text output" : "Heuristic dispose from provider text output");
+  return { important, confidence, reason };
+}
+
+function normalizeClassification(data) {
+  if (!data || typeof data !== "object") return null;
+  let important = data.important;
+  if (typeof important === "string") {
+    const v = important.trim().toLowerCase();
+    if (v === "true") important = true;
+    else if (v === "false") important = false;
+    else return null;
+  }
+  if (typeof important !== "boolean") return null;
+  const confidenceRaw = Number(data.confidence);
+  if (!Number.isFinite(confidenceRaw)) return null;
+  const confidence = Math.max(0, Math.min(1, confidenceRaw));
+  const reason = String(data.reason ?? "").slice(0, 160);
+  return { important, confidence, reason, raw: data };
+}
+
+function isUnusableCopilotReason(reason) {
+  const lower = String(reason || "").toLowerCase();
+  return (
+    lower.includes("don't see a screenshot") ||
+    lower.includes("no screenshot attached") ||
+    lower.includes("no screenshot") ||
+    lower.includes("no image attached") ||
+    lower.includes("no image provided") ||
+    lower.includes("message was cut off") ||
+    lower.includes("message was truncated") ||
+    lower.includes("additional details were included") ||
+    lower.includes("additional details were provided") ||
+    lower.includes("could you provide") ||
+    lower.includes("message may be incomplete")
+  );
+}
+
+function shouldFallbackCopilotToCodex(error) {
+  const msg = String(error?.message || error || "").toLowerCase();
+  if (!msg) return false;
+  return (
+    msg.includes("could not parse json") ||
+    msg.includes("unknown option '--image'") ||
+    msg.includes("provider timeout") ||
+    msg.includes("no screenshot attached") ||
+    msg.includes("no screenshot") ||
+    msg.includes("no image attached") ||
+    msg.includes("no image provided") ||
+    msg.includes("message was cut off") ||
+    msg.includes("message was truncated") ||
+    msg.includes("message may be incomplete")
+  );
+}
+
 function getByPath(obj, pathExpr) {
   if (!pathExpr) return obj;
   const parts = pathExpr.split(".").filter(Boolean);
@@ -332,6 +554,44 @@ function getByPath(obj, pathExpr) {
     cursor = cursor[part];
   }
   return cursor;
+}
+
+function makePrompt(basePrompt, aggressive) {
+  if (!aggressive) return basePrompt;
+  return [
+    String(basePrompt || "").trim(),
+    "Aggressive cleanup mode:",
+    "- Be conservative about keeping files; when unsure, mark important=false.",
+    "- Error dialogs, broken paths, blank/near-blank shots, and transient app states are disposable.",
+    "- Keep strict JSON output only."
+  ].join("\n");
+}
+
+function getCopilotCompatTimeoutMs(config) {
+  const base = Number(config?.requestTimeoutMs || 30000);
+  return Math.max(base, 45000);
+}
+
+function quoteCmdArg(value) {
+  const text = String(value ?? "");
+  if (!text.length) return "\"\"";
+  return `"${text.replace(/"/g, "\"\"")}"`;
+}
+
+function spawnCapture(command, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, options);
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.on("error", reject);
+    child.on("close", (code) => resolve({ code: Number(code || 0), stdout, stderr }));
+  });
 }
 
 async function runProvider(config, providerName, model, imagePath, prompt, verbose) {
@@ -348,18 +608,39 @@ async function runProvider(config, providerName, model, imagePath, prompt, verbo
     image: imagePath,
     prompt
   });
+  const displayArgsRaw = fillTemplate(provider.args, {
+    model: model || provider.model,
+    image: imagePath,
+    prompt: "<prompt>"
+  });
+  const displayArgs = formatProviderCmdArgsForDisplay(displayArgsRaw);
+  const preferCopilotCompat = providerName === "copilot" && finalArgs.includes("--image");
   const promptMode = provider.promptMode === "stdin" ? "stdin" : "arg";
 
-  if (verbose) {
-    console.log(`provider cmd: ${provider.command} ${finalArgs.join(" ")}`);
+  if (verbose && !preferCopilotCompat) {
+    console.log("");
+    console.log(`${labelInfo("provider cmd:")} ${provider.command} ${labelDim(displayArgs.join(" "))}`);
   }
 
-  const useShell = /\.(cmd|bat|ps1)$/i.test(String(provider.command || ""));
-  const runOnce = (args) => {
-    const child = spawn(provider.command, args, {
-      stdio: ["pipe", "pipe", "pipe"],
-      shell: useShell
-    });
+  const commandText = String(provider.command || "");
+  const isCmdScript = /\.(cmd|bat)$/i.test(commandText);
+  const isPowerShellScript = /\.ps1$/i.test(commandText);
+  const runOnce = (args, timeoutOverrideMs) => {
+    let child;
+    if (process.platform === "win32" && isCmdScript) {
+      const cmdExe = process.env.ComSpec || "cmd.exe";
+      child = spawn(cmdExe, ["/d", "/c", provider.command, ...args], {
+        stdio: ["pipe", "pipe", "pipe"]
+      });
+    } else if (process.platform === "win32" && isPowerShellScript) {
+      child = spawn("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", provider.command, ...args], {
+        stdio: ["pipe", "pipe", "pipe"]
+      });
+    } else {
+      child = spawn(provider.command, args, {
+        stdio: ["pipe", "pipe", "pipe"]
+      });
+    }
 
     let stdout = "";
     let stderr = "";
@@ -388,7 +669,8 @@ async function runProvider(config, providerName, model, imagePath, prompt, verbo
       });
     });
 
-    return Promise.race([waitForExit, withTimeout(child, config.requestTimeoutMs)]);
+    const timeoutMs = Math.max(1, Number(timeoutOverrideMs || config.requestTimeoutMs));
+    return Promise.race([waitForExit, withTimeout(child, timeoutMs)]);
   };
 
   function withCodexSkipRepoCheck(args) {
@@ -403,7 +685,49 @@ async function runProvider(config, providerName, model, imagePath, prompt, verbo
     return next;
   }
 
+  function buildCopilotCompatArgs() {
+    const absoluteImagePath = path.resolve(imagePath);
+    const imageFileUrl = pathToFileURL(absoluteImagePath).href;
+    const compatPrompt = [
+      "Classify one local screenshot for cleanup.",
+      `ImagePath=${absoluteImagePath}`,
+      `ImageUrl=${imageFileUrl}`,
+      "Read exactly that file before deciding.",
+      "If file cannot be read output exactly:",
+      "{\"important\":true,\"confidence\":0,\"reason\":\"provider_could_not_read_image\"}.",
+      "Otherwise output strict JSON only with keys important,confidence,reason.",
+      "important=true only for durable artifacts (code/errors/receipts/docs/proofs).",
+      "Otherwise important=false. Keep reason under 80 chars."
+    ].join(" ");
+    const compatArgs = [
+      "-p",
+      compatPrompt,
+      "--model",
+      String(model || provider.model || "gpt-5-mini"),
+      "--yolo",
+      "--allow-all-paths",
+      "--add-dir",
+      path.dirname(absoluteImagePath),
+      "--no-custom-instructions",
+      "--output-format",
+      "json"
+    ];
+    return compatArgs;
+  }
+
   let stdout = "";
+  if (preferCopilotCompat) {
+    const compatArgs = buildCopilotCompatArgs();
+    const compatDisplayArgs = formatProviderCmdArgsForDisplay(compatArgs);
+    if (verbose) {
+      console.log("");
+      console.log(`${labelInfo("provider mode:")} Copilot compatibility mode (no --image)`);
+      console.log(`${labelInfo("provider cmd:")} ${provider.command} ${labelDim(compatDisplayArgs.join(" "))}`);
+    }
+    const compatTimeoutMs = getCopilotCompatTimeoutMs(config);
+    const res = await runOnce(compatArgs, compatTimeoutMs);
+    stdout = res.stdout;
+  } else {
   try {
     const res = await runOnce(finalArgs);
     stdout = res.stdout;
@@ -412,25 +736,141 @@ async function runProvider(config, providerName, model, imagePath, prompt, verbo
     const canRetryForTrustCheck =
       (providerName === "codex" || commandLower.includes("codex")) &&
       String(error?.message || "").toLowerCase().includes("not inside a trusted directory");
-    if (!canRetryForTrustCheck) throw error;
-    const retryArgs = withCodexSkipRepoCheck(finalArgs);
-    if (verbose) {
-      console.log("provider retry: adding --skip-git-repo-check");
-      console.log(`provider cmd: ${provider.command} ${retryArgs.join(" ")}`);
+    if (canRetryForTrustCheck) {
+      const retryArgs = withCodexSkipRepoCheck(finalArgs);
+      const retryDisplayArgs = withCodexSkipRepoCheck(displayArgs);
+      if (verbose) {
+        console.log("");
+        console.log(`${labelWarn("provider retry:")} adding --skip-git-repo-check`);
+        console.log(`${labelInfo("provider cmd:")} ${provider.command} ${labelDim(retryDisplayArgs.join(" "))}`);
+      }
+      const res = await runOnce(retryArgs);
+      stdout = res.stdout;
+    } else {
+      const canRetryCopilotCompat =
+        providerName === "copilot" &&
+        String(error?.message || "").toLowerCase().includes("unknown option '--image'");
+      if (!canRetryCopilotCompat) throw error;
+      const compatArgs = buildCopilotCompatArgs();
+      const compatDisplayArgs = formatProviderCmdArgsForDisplay(compatArgs);
+      if (verbose) {
+        console.log("");
+        console.log(`${labelWarn("provider retry:")} Copilot compatibility mode (no --image)`);
+        console.log(`${labelInfo("provider cmd:")} ${provider.command} ${labelDim(compatDisplayArgs.join(" "))}`);
+      }
+      const compatTimeoutMs = getCopilotCompatTimeoutMs(config);
+      const res = await runOnce(compatArgs, compatTimeoutMs);
+      stdout = res.stdout;
     }
-    const res = await runOnce(retryArgs);
-    stdout = res.stdout;
   }
-  const parsed = extractFirstJson(stdout);
-  if (!parsed) {
+  }
+  const copilotAssistantParsed = providerName === "copilot" ? extractCopilotAssistantJson(stdout) : null;
+  const parsed = copilotAssistantParsed || extractFirstJson(stdout);
+  const fallbackHeuristic = !parsed && providerName === "copilot"
+    ? heuristicClassificationFromText(stdout)
+    : null;
+  const finalParsed = parsed || fallbackHeuristic;
+  if (!finalParsed) {
     throw new Error(`Could not parse JSON from provider output: ${stdout.slice(0, 400)}`);
   }
 
-  const data = getByPath(parsed, provider.outputJsonPath || "") || parsed;
-  const important = Boolean(data.important);
-  const confidence = Number(data.confidence ?? 0);
-  const reason = String(data.reason ?? "").slice(0, 160);
-  return { important, confidence, reason, raw: data };
+  const data = getByPath(finalParsed, provider.outputJsonPath || "") || finalParsed;
+  const normalized = normalizeClassification(data);
+  if (!normalized) {
+    throw new Error(`Invalid classification schema from provider output: ${JSON.stringify(data).slice(0, 260)}`);
+  }
+  if (providerName === "copilot" && isUnusableCopilotReason(normalized.reason)) {
+    throw new Error(`Copilot returned unusable classification text: ${normalized.reason}`);
+  }
+  return normalized;
+}
+
+function validateTimeHHmm(value) {
+  const text = String(value || "").trim();
+  if (!/^([01]\d|2[0-3]):([0-5]\d)$/.test(text)) {
+    throw new Error(`Invalid time "${value}". Use HH:mm (24h), e.g. 09:30`);
+  }
+  return text;
+}
+
+function buildScheduleRunArgs(configPath, args) {
+  const runArgs = ["run-daily", "--config", configPath];
+  const folder = args.folder ? path.resolve(String(args.folder)) : "";
+  if (folder) runArgs.push(folder);
+  if (args.provider) runArgs.push("--provider", String(args.provider));
+  if (args.model) runArgs.push("--model", String(args.model));
+  if (args.action) runArgs.push("--action", String(args.action));
+  if (args["max-files"] !== undefined) runArgs.push("--max-files", String(args["max-files"]));
+  if (args["oldest-first"]) runArgs.push("--oldest-first");
+  if (args["newest-first"]) runArgs.push("--newest-first");
+  if (args.aggressive) runArgs.push("--aggressive");
+  if (args.verbose) runArgs.push("--verbose");
+  return runArgs;
+}
+
+async function commandSchedule(configPath, args) {
+  if (process.platform !== "win32") {
+    throw new Error("schedule command currently supports Windows only.");
+  }
+  const op = String(args._[1] || "status").toLowerCase();
+  const taskName = String(args["task-name"] || getDefaultScheduleTaskName());
+
+  if (op === "install") {
+    const time = validateTimeHHmm(args.time || "09:00");
+    const runArgs = buildScheduleRunArgs(configPath, args);
+    const nodeExe = process.execPath;
+    const scriptPath = path.resolve(__filename);
+    const taskRunCommand = [quoteCmdArg(nodeExe), quoteCmdArg(scriptPath), ...runArgs.map(quoteCmdArg)].join(" ");
+    const created = await spawnCapture("schtasks.exe", [
+      "/Create",
+      "/F",
+      "/SC",
+      "DAILY",
+      "/TN",
+      taskName,
+      "/TR",
+      taskRunCommand,
+      "/ST",
+      time
+    ]);
+    if (created.code !== 0) {
+      throw new Error(`Failed to create scheduled task: ${created.stderr.trim() || created.stdout.trim() || "unknown error"}`);
+    }
+    console.log(`Scheduled task installed: ${taskName}`);
+    console.log(`Time: ${time}`);
+    console.log(`Command: ${taskRunCommand}`);
+    return;
+  }
+
+  if (op === "status") {
+    const queried = await spawnCapture("schtasks.exe", ["/Query", "/TN", taskName, "/V", "/FO", "LIST"]);
+    if (queried.code !== 0) {
+      console.log(`Task not found: ${taskName}`);
+      return;
+    }
+    console.log(queried.stdout.trim());
+    return;
+  }
+
+  if (op === "run-now" || op === "run" || op === "now" || op === "runnow") {
+    const started = await spawnCapture("schtasks.exe", ["/Run", "/TN", taskName]);
+    if (started.code !== 0) {
+      throw new Error(`Failed to run scheduled task now: ${started.stderr.trim() || started.stdout.trim() || "unknown error"}`);
+    }
+    console.log(`Scheduled task started: ${taskName}`);
+    return;
+  }
+
+  if (op === "uninstall" || op === "remove" || op === "delete") {
+    const deleted = await spawnCapture("schtasks.exe", ["/Delete", "/F", "/TN", taskName]);
+    if (deleted.code !== 0) {
+      throw new Error(`Failed to delete scheduled task: ${deleted.stderr.trim() || deleted.stdout.trim() || "unknown error"}`);
+    }
+    console.log(`Scheduled task removed: ${taskName}`);
+    return;
+  }
+
+  throw new Error(`Unknown schedule operation: ${op}. Use install, status, run-now, or uninstall.`);
 }
 
 async function runPool(items, concurrency, worker) {
@@ -926,6 +1366,87 @@ function shortPath(filePath) {
   return filePath;
 }
 
+function knownProviders(config) {
+  return Object.keys(config?.providers || {});
+}
+
+function validateProviderConfig(config, providerName) {
+  const provider = config?.providers?.[providerName];
+  if (!provider) {
+    const available = knownProviders(config);
+    throw new Error(
+      `Unknown provider "${providerName}". Available providers: ${available.length ? available.join(", ") : "none"}`
+    );
+  }
+  if (!provider.enabled) {
+    throw new Error(
+      [
+        `Provider "${providerName}" is disabled in config.`,
+        `Enable it with: ssc config set providers.${providerName}.enabled true`,
+        `Then rerun with: ssc run --provider ${providerName} ...`
+      ].join("\n")
+    );
+  }
+  if (!provider.command || !Array.isArray(provider.args)) {
+    throw new Error(
+      [
+        `Provider "${providerName}" is missing command/args configuration.`,
+        `Set command with: ssc config set providers.${providerName}.command <cli-command>`,
+        `Set args with: ssc config set providers.${providerName}.args \"[\\\"...\\\"]\"`
+      ].join("\n")
+    );
+  }
+}
+
+async function commandExists(commandName) {
+  const cmd = String(commandName || "").trim();
+  if (!cmd) return false;
+  const hasPathSeparator = /[\\/]/.test(cmd);
+  if (hasPathSeparator) {
+    const abs = path.resolve(cmd);
+    return pathExists(abs);
+  }
+  const finder = process.platform === "win32" ? "where" : "which";
+  const result = await spawnCapture(finder, [cmd], { stdio: ["ignore", "pipe", "pipe"] });
+  return result.code === 0;
+}
+
+async function validateProviderRuntime(config, providerName) {
+  const provider = config.providers[providerName];
+  const found = await commandExists(provider.command);
+  if (!found) {
+    throw new Error(
+      [
+        `Provider command not found: ${provider.command}`,
+        `Install ${providerName} CLI or set full command path with:`,
+        `ssc config set providers.${providerName}.command <full-path-or-command>`
+      ].join("\n")
+    );
+  }
+}
+
+function toFriendlyProviderError(error, providerName, providerCommand) {
+  const raw = String(error?.message || error || "").trim();
+  if (!raw) return "provider execution failed";
+  const lower = raw.toLowerCase();
+  if (lower.includes("enoent") || lower.includes("not recognized as an internal or external command")) {
+    return [
+      `Provider command not found: ${providerCommand}`,
+      `Set it with: ssc config set providers.${providerName}.command <full-path-or-command>`
+    ].join(" | ");
+  }
+  if (lower.includes("timeout")) {
+    return "Provider timed out. Try increasing requestTimeoutMs in config.";
+  }
+  if (lower.includes("unknown option '--image'")) {
+    return [
+      "Current provider CLI does not support --image in this mode.",
+      "SSC can retry with Copilot compatibility mode (prompt + local image path)."
+    ].join(" | ");
+  }
+  return raw;
+}
+
 async function commandRun(configPath, args, options = {}) {
   const config = await loadConfig(configPath);
   config.extensions = normalizeExtensions(config.extensions);
@@ -934,13 +1455,19 @@ async function commandRun(configPath, args, options = {}) {
   const folderArg = args.folder || args._[1];
   const inputFolder = path.resolve(folderArg || config.defaultFolder);
   const provider = String(args.provider || config.provider || "codex");
+  validateProviderConfig(config, provider);
+  await validateProviderRuntime(config, provider);
   const model = args.model ? String(args.model) : undefined;
   const configuredMaxFiles = dailyOpts
     ? toNumber(args["max-files"], dailyOpts.maxFilesPerRun)
     : toNumber(args["max-files"], config.maxFilesPerRun);
   const maxFiles = Math.max(1, configuredMaxFiles);
   const minSizeKB = toNumber(args["min-size-kb"], config.minFileSizeKB);
-  const threshold = toNumber(args.threshold, config.importanceThreshold);
+  const aggressive = Boolean(args.aggressive || dailyOpts?.aggressive);
+  const thresholdDefault = aggressive
+    ? Math.min(toNumber(config.importanceThreshold, 0.65), 0.35)
+    : config.importanceThreshold;
+  const threshold = toNumber(args.threshold, thresholdDefault);
   const sortOrder =
     args["oldest-first"] || dailyOpts?.sortOrder === "oldest"
       ? "oldest"
@@ -951,7 +1478,7 @@ async function commandRun(configPath, args, options = {}) {
           : "newest";
   const baseConcurrency = toNumber(args.concurrency, config.maxConcurrency);
   const concurrency = dailyOpts ? 1 : baseConcurrency;
-  const action = String(args.action || dailyOpts?.action || config.action || "report");
+  const action = String(args.action || dailyOpts?.action || (aggressive ? "move" : config.action) || "report");
   const dryRun = Boolean(args["dry-run"] || action === "report");
   const force = Boolean(args.force);
   const verbose = Boolean(args.verbose);
@@ -985,8 +1512,21 @@ async function commandRun(configPath, args, options = {}) {
   }
 
   let modelCallsUsed = 0;
-  const prompt = config.promptTemplate;
+  let codexFallbacksUsed = 0;
+  let fatalProviderError = "";
+  const prompt = makePrompt(config.promptTemplate, aggressive);
   const results = await runPool(filtered, concurrency, async (meta) => {
+    if (fatalProviderError) {
+      return {
+        ...meta,
+        important: true,
+        confidence: 0,
+        reason: `provider_error:${fatalProviderError}`.slice(0, 220),
+        fromCache: false,
+        errored: true,
+        skippedByProviderFailure: true
+      };
+    }
     const key = cacheKey(meta);
     if (config.cacheEnabled && cache[key] && !force) {
       return { ...meta, ...cache[key], fromCache: true };
@@ -1003,16 +1543,40 @@ async function commandRun(configPath, args, options = {}) {
     }
     try {
       modelCallsUsed += 1;
-      const classified = await runProvider(config, provider, model, meta.filePath, prompt, verbose);
+      let classified;
+      try {
+        classified = await runProvider(config, provider, model, meta.filePath, prompt, verbose);
+      } catch (providerError) {
+        const canFallback =
+          provider === "copilot" &&
+          config?.providers?.codex?.enabled &&
+          shouldFallbackCopilotToCodex(providerError);
+        if (!canFallback) throw providerError;
+        if (verbose) {
+          console.log(`provider fallback: copilot -> codex (${shortPath(meta.filePath)})`);
+        }
+        modelCallsUsed += 1;
+        codexFallbacksUsed += 1;
+        classified = await runProvider(config, "codex", undefined, meta.filePath, prompt, verbose);
+      }
       const payload = { ...classified, updatedAt: new Date().toISOString() };
       if (config.cacheEnabled) cache[key] = payload;
       return { ...meta, ...payload, fromCache: false };
     } catch (error) {
+      const providerCommand = String(config.providers?.[provider]?.command || provider);
+      const friendly = toFriendlyProviderError(error, provider, providerCommand);
+      const fatalMatch =
+        friendly.toLowerCase().includes("provider command not found") ||
+        friendly.toLowerCase().includes("is disabled in config") ||
+        friendly.toLowerCase().includes("must define command + args");
+      if (fatalMatch && !fatalProviderError) {
+        fatalProviderError = friendly;
+      }
       return {
         ...meta,
         important: true,
         confidence: 0,
-        reason: `provider_error:${error.message}`.slice(0, 160),
+        reason: `provider_error:${friendly}`.slice(0, 220),
         fromCache: false,
         errored: true
       };
@@ -1020,36 +1584,94 @@ async function commandRun(configPath, args, options = {}) {
   });
 
   const disposable = results.filter((row) => !row.important && row.confidence >= threshold);
+  const lowConfidenceNonImportant = results.filter((row) => !row.important && row.confidence < threshold);
+  const strictImportant = results.filter((row) => row.important);
   const actionable = dailyOpts?.remainingActions !== undefined
     ? disposable.slice(0, Math.max(0, dailyOpts.remainingActions))
     : disposable;
   const important = results.length - disposable.length;
   const cachedCount = results.filter((row) => row.fromCache).length;
-  const erroredCount = results.filter((row) => row.errored).length;
+  const erroredCount = results.filter((row) => row.errored && !row.skippedByProviderFailure).length;
   const budgetSkipped = results.filter((row) => row.skippedByBudget).length;
+  const providerSkipped = results.filter((row) => row.skippedByProviderFailure).length;
 
-  console.log(`Scanned: ${results.length} files`);
-  console.log(`Important/kept: ${important}`);
-  console.log(`Disposable candidates: ${disposable.length} (threshold=${threshold})`);
-  if (dailyOpts?.remainingActions !== undefined) {
-    console.log(`Action budget allows: ${actionable.length}`);
+  console.log("");
+  console.log(paint("Run Summary", ANSI.bold));
+  console.log(`${labelInfo("Scanned:")} ${results.length} files`);
+  console.log(`${labelInfo("Provider call attempts:")} ${modelCallsUsed}`);
+  console.log(`${labelOk("Important/kept:")} ${important}`);
+  console.log(`${labelWarn("Disposable candidates:")} ${disposable.length} ${labelDim(`(threshold=${threshold})`)}`);
+  if (lowConfidenceNonImportant.length) {
+    console.log(`${labelDim("Non-important but below threshold:")} ${lowConfidenceNonImportant.length}`);
   }
-  console.log(`Cache hits: ${cachedCount}`);
-  if (budgetSkipped) console.log(`Skipped by daily model budget: ${budgetSkipped}`);
-  if (erroredCount) console.log(`Provider errors: ${erroredCount}`);
+  if (dailyOpts?.remainingActions !== undefined) {
+    console.log(`${labelInfo("Action budget allows:")} ${actionable.length}`);
+  }
+  console.log(`${labelInfo("Cache hits:")} ${cachedCount}`);
+  if (budgetSkipped) console.log(`${labelWarn("Skipped by daily model budget:")} ${budgetSkipped}`);
+  if (providerSkipped) console.log(`${labelWarn("Skipped by provider failure:")} ${providerSkipped}`);
+  if (codexFallbacksUsed) console.log(`${labelWarn("Copilot->Codex fallbacks:")} ${codexFallbacksUsed}`);
+  if (erroredCount) console.log(`${labelErr("Provider errors:")} ${erroredCount}`);
+  if (verbose && erroredCount) {
+    console.log("");
+    console.log(paint("Provider Error Samples", ANSI.bold));
+    const sampleErrors = results.filter((row) => row.errored && !row.skippedByProviderFailure).slice(0, 5);
+    for (const row of sampleErrors) {
+      console.log(
+        `${labelErr("! provider_error")} ${paint(shortPath(row.filePath), ANSI.bold)} ${labelDim("|")} ${labelErr(row.reason)}`
+      );
+    }
+    if (erroredCount > sampleErrors.length) {
+      console.log(`${labelErr("!")} ... and ${erroredCount - sampleErrors.length} more provider errors`);
+    }
+  }
+  if ((erroredCount > 0 || providerSkipped > 0) && erroredCount + providerSkipped === results.length) {
+    const first = results.find((row) => row.errored);
+    const reason = String(first?.reason || "").replace(/^provider_error:/, "");
+    console.log("");
+    console.log(labelErr("All files failed provider classification."));
+    if (reason) console.log(`${labelErr("First error:")} ${reason}`);
+    console.log(
+      `${labelWarn("Tip:")} run 'ssc config get' and verify providers.${provider}.enabled, command, args, and model.`
+    );
+  }
 
+  if (actionable.length) {
+    console.log("");
+    console.log(paint("Disposable Candidates", ANSI.bold));
+  }
   for (const row of actionable.slice(0, 20)) {
     console.log(
-      `- ${shortPath(row.filePath)} | conf=${row.confidence.toFixed(2)} | ${row.reason || "no reason"}`
+      `${labelWarn("-")} ${paint(shortPath(row.filePath), ANSI.bold)} ${labelDim("|")} ${labelInfo(`conf=${row.confidence.toFixed(2)}`)} ${labelDim("|")} ${labelWarn(row.reason || "no reason")}`
     );
   }
   if (actionable.length > 20) {
     console.log(`... and ${actionable.length - 20} more`);
   }
+  if (verbose && actionable.length === 0) {
+    console.log("");
+    console.log(paint("No disposable candidates. Keep reasons (sample):", ANSI.bold));
+    for (const row of results.slice(0, 10)) {
+      const decision = row.important
+        ? "kept: important=true"
+        : row.confidence < threshold
+          ? `kept: confidence ${row.confidence.toFixed(2)} < threshold ${threshold}`
+          : "kept: other";
+      console.log(
+        `${labelOk("-")} ${paint(shortPath(row.filePath), ANSI.bold)} ${labelDim("|")} ${labelOk(decision)} ${labelDim("|")} ${labelDim(row.reason || "no reason")}`
+      );
+    }
+    if (results.length > 10) {
+      console.log(`... and ${results.length - 10} more kept files`);
+    }
+  }
 
   if (!actionable.length || dryRun) {
     if (config.cacheEnabled) await writeJson(cachePath, cache);
-    if (dryRun) console.log("Dry run mode. No files changed.");
+    if (dryRun) {
+      console.log("");
+      console.log(labelDim("Dry run mode. No files changed."));
+    }
     return { modelCallsUsed, actionedCount: 0, scanned: results.length, candidates: disposable.length };
   }
 
@@ -1072,12 +1694,14 @@ async function commandRun(configPath, args, options = {}) {
       await ensureDir(path.dirname(target));
       await fs.rename(row.filePath, target);
     }
-    console.log(`Moved ${actionable.length} files to ${quarantineRoot}`);
+    console.log("");
+    console.log(labelOk(`Moved ${actionable.length} files to ${quarantineRoot}`));
   } else if (action === "delete") {
     for (const row of actionable) {
       await fs.unlink(row.filePath);
     }
-    console.log(`Deleted ${actionable.length} files.`);
+    console.log("");
+    console.log(labelOk(`Deleted ${actionable.length} files.`));
   }
 
   if (config.cacheEnabled) await writeJson(cachePath, cache);
@@ -1112,12 +1736,16 @@ async function commandRunDaily(configPath, args) {
     return;
   }
 
+  const aggressive = Boolean(args.aggressive);
+  const requestedDailyAction = args.action ? String(args.action) : "";
+  const dailyAction = requestedDailyAction || (aggressive ? "move" : String(daily.action || "move"));
   const summary = await commandRun(configPath, args, {
     daily: {
       maxFilesPerRun: Math.max(1, toNumber(daily.maxFilesPerRun, 20)),
       sortOrder: daily.sortOrder === "newest" ? "newest" : "oldest",
-      action: String(daily.action || "move"),
-      autoYes: daily.action === "move" || daily.action === "delete",
+      action: dailyAction,
+      autoYes: dailyAction === "move" || dailyAction === "delete",
+      aggressive,
       remainingModelCalls,
       remainingActions
     }
@@ -1300,7 +1928,7 @@ async function main() {
   const configPath = getConfigPath(args.config);
 
   if (command === "help" || args.h || args.help) {
-    printHelp();
+    await printHelp(configPath);
     return;
   }
   if (command === "init") {
@@ -1330,6 +1958,10 @@ async function main() {
   }
   if (command === "run-daily") {
     await commandRunDaily(configPath, args);
+    return;
+  }
+  if (command === "schedule") {
+    await commandSchedule(configPath, args);
     return;
   }
   if (command === "install") {
