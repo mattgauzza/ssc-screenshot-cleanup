@@ -2,6 +2,16 @@
 
 `ssc` is a Windows-first CLI that classifies screenshots as important vs disposable, then reports, moves, or deletes low-value captures with budget controls.
 
+## About This Project
+
+Not sure about you, but after using coding CLIs for a while I end up with thousands of screenshots.
+
+![Screenshots folder with item count](./assets/readme/screenshots-folder.png)
+
+I ain't cleaning all that up myself. Let the CLIs do it! Install ScreenShotCleanup.
+
+![CLI all the things meme](./assets/readme/cli-all-the-things.jpg)
+
 ## Features
 
 - Interactive setup and uninstall: `ssc --install`, `ssc --uninstall`
