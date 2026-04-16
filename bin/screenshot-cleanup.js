@@ -631,6 +631,62 @@ function quoteCmdArg(value) {
   return `"${text.replace(/"/g, "\"\"")}"`;
 }
 
+function sanitizeTaskNameForFileName(taskName) {
+  const raw = String(taskName || "").trim();
+  const cleaned = raw.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
+  return cleaned || "default";
+}
+
+function getScheduleRunnerScriptPath(configPath, taskName) {
+  const dir = path.dirname(configPath);
+  const safeName = sanitizeTaskNameForFileName(taskName);
+  return path.join(dir, `schedule-runner-${safeName}.cmd`);
+}
+
+async function writeScheduleRunnerScript(configPath, taskName, nodeExe, scriptPath, runArgs) {
+  const runnerPath = getScheduleRunnerScriptPath(configPath, taskName);
+  await ensureDir(path.dirname(runnerPath));
+  const commandLine = [
+    quoteCmdArg(nodeExe),
+    quoteCmdArg(scriptPath),
+    ...runArgs.map(quoteCmdArg)
+  ].join(" ");
+  const content = [
+    "@echo off",
+    "setlocal",
+    `${commandLine}`,
+    "exit /b %ERRORLEVEL%",
+    ""
+  ].join("\r\n");
+  await fs.writeFile(runnerPath, content, "utf8");
+  return runnerPath;
+}
+
+function getTaskNameVariants(taskName) {
+  const raw = String(taskName || "").trim();
+  if (!raw) return [raw];
+  const variants = [];
+  if (raw.startsWith("\\")) {
+    variants.push(raw);
+    variants.push(raw.slice(1));
+  } else {
+    variants.push(raw);
+    variants.push(`\\${raw}`);
+  }
+  return Array.from(new Set(variants.filter(Boolean)));
+}
+
+async function spawnSchtasksWithTaskName(prefixArgs, taskName, suffixArgs = []) {
+  const variants = getTaskNameVariants(taskName);
+  let last = null;
+  for (const variant of variants) {
+    const result = await spawnCapture("schtasks.exe", [...prefixArgs, variant, ...suffixArgs]);
+    if (result.code === 0) return result;
+    last = result;
+  }
+  return last || { code: 1, stdout: "", stderr: "unknown error" };
+}
+
 function spawnCapture(command, args, options = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, options);
@@ -873,7 +929,9 @@ async function commandSchedule(configPath, args) {
     const runArgs = buildScheduleRunArgs(configPath, args);
     const nodeExe = process.execPath;
     const scriptPath = path.resolve(__filename);
-    const taskRunCommand = [quoteCmdArg(nodeExe), quoteCmdArg(scriptPath), ...runArgs.map(quoteCmdArg)].join(" ");
+    const runnerPath = await writeScheduleRunnerScript(configPath, taskName, nodeExe, scriptPath, runArgs);
+    const comspec = process.env.ComSpec || "cmd.exe";
+    const taskRunCommand = `${quoteCmdArg(comspec)} /d /c ${quoteCmdArg(runnerPath)}`;
     const created = await spawnCapture("schtasks.exe", [
       "/Create",
       "/F",
@@ -891,12 +949,13 @@ async function commandSchedule(configPath, args) {
     }
     console.log(`Scheduled task installed: ${taskName}`);
     console.log(`Time: ${time}`);
+    console.log(`Runner script: ${runnerPath}`);
     console.log(`Command: ${taskRunCommand}`);
     return;
   }
 
   if (op === "status") {
-    const queried = await spawnCapture("schtasks.exe", ["/Query", "/TN", taskName, "/V", "/FO", "LIST"]);
+    const queried = await spawnSchtasksWithTaskName(["/Query", "/TN"], taskName, ["/V", "/FO", "LIST"]);
     if (queried.code !== 0) {
       console.log(`Task not found: ${taskName}`);
       return;
@@ -906,7 +965,7 @@ async function commandSchedule(configPath, args) {
   }
 
   if (op === "run-now" || op === "run" || op === "now" || op === "runnow") {
-    const started = await spawnCapture("schtasks.exe", ["/Run", "/TN", taskName]);
+    const started = await spawnSchtasksWithTaskName(["/Run", "/TN"], taskName);
     if (started.code !== 0) {
       throw new Error(`Failed to run scheduled task now: ${started.stderr.trim() || started.stdout.trim() || "unknown error"}`);
     }
@@ -915,10 +974,12 @@ async function commandSchedule(configPath, args) {
   }
 
   if (op === "uninstall" || op === "remove" || op === "delete") {
-    const deleted = await spawnCapture("schtasks.exe", ["/Delete", "/F", "/TN", taskName]);
+    const deleted = await spawnSchtasksWithTaskName(["/Delete", "/F", "/TN"], taskName);
     if (deleted.code !== 0) {
       throw new Error(`Failed to delete scheduled task: ${deleted.stderr.trim() || deleted.stdout.trim() || "unknown error"}`);
     }
+    const runnerPath = getScheduleRunnerScriptPath(configPath, taskName);
+    await fs.unlink(runnerPath).catch(() => {});
     console.log(`Scheduled task removed: ${taskName}`);
     return;
   }
