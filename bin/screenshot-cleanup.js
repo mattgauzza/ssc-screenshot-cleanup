@@ -24,8 +24,8 @@ const DEFAULT_CONFIG = {
   sortOrder: "newest",
   minFileSizeKB: 10,
   cacheEnabled: true,
-  maxConcurrency: 2,
-  requestTimeoutMs: 30000,
+  maxConcurrency: 1,
+  requestTimeoutMs: 60000,
   provider: "codex",
   providers: {
     codex: {
@@ -1590,7 +1590,8 @@ async function commandRun(configPath, args, options = {}) {
         : config.sortOrder === "oldest"
           ? "oldest"
           : "newest";
-  const baseConcurrency = toNumber(args.concurrency, config.maxConcurrency);
+  const defaultConcurrency = provider === "copilot" ? 1 : config.maxConcurrency;
+  const baseConcurrency = toNumber(args.concurrency, defaultConcurrency);
   const concurrency = dailyOpts ? 1 : baseConcurrency;
   const action = String(args.action || dailyOpts?.action || (aggressive ? "move" : config.action) || "report");
   const dryRun = Boolean(args["dry-run"] || action === "report");
