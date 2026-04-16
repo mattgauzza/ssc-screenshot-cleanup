@@ -58,6 +58,7 @@ const DEFAULT_CONFIG = {
         "{prompt}"
       ],
       model: "gpt-4.1",
+      fallbackToCodex: false,
       outputJsonPath: ""
     }
   },
@@ -146,6 +147,57 @@ function labelErr(text) {
 
 function labelDim(text) {
   return paint(text, ANSI.dim);
+}
+
+function getTerminalColumns() {
+  const cols = Number(process.stdout?.columns || 0);
+  if (Number.isFinite(cols) && cols >= 40) return cols;
+  return 120;
+}
+
+function wrapTextLines(text, width) {
+  const maxWidth = Math.max(20, Number(width) || 80);
+  const input = String(text || "");
+  const paragraphs = input.split(/\r?\n/);
+  const lines = [];
+  for (const paragraph of paragraphs) {
+    const words = paragraph.trim().split(/\s+/).filter(Boolean);
+    if (!words.length) {
+      lines.push("");
+      continue;
+    }
+    let current = words[0];
+    for (let i = 1; i < words.length; i += 1) {
+      const next = words[i];
+      if (`${current} ${next}`.length <= maxWidth) {
+        current = `${current} ${next}`;
+      } else {
+        lines.push(current);
+        if (next.length > maxWidth) {
+          let rest = next;
+          while (rest.length > maxWidth) {
+            lines.push(rest.slice(0, maxWidth));
+            rest = rest.slice(maxWidth);
+          }
+          current = rest;
+        } else {
+          current = next;
+        }
+      }
+    }
+    lines.push(current);
+  }
+  return lines.length ? lines : [""];
+}
+
+function printWrappedReason(reason, colorize) {
+  const indent = "   ";
+  const width = getTerminalColumns() - indent.length;
+  const lines = wrapTextLines(reason, width);
+  for (const line of lines) {
+    const rendered = colorize ? colorize(line) : line;
+    console.log(`${indent}${rendered}`);
+  }
 }
 
 function formatProviderCmdArgsForDisplay(args) {
@@ -569,7 +621,8 @@ function makePrompt(basePrompt, aggressive) {
 
 function getCopilotCompatTimeoutMs(config) {
   const base = Number(config?.requestTimeoutMs || 30000);
-  return Math.max(base, 45000);
+  // Keep Copilot compatibility mode aligned with standard request timeout to avoid slow tail latency.
+  return Math.max(1000, base);
 }
 
 function quoteCmdArg(value) {
@@ -1550,6 +1603,7 @@ async function commandRun(configPath, args, options = {}) {
         const canFallback =
           provider === "copilot" &&
           config?.providers?.codex?.enabled &&
+          config?.providers?.copilot?.fallbackToCodex === true &&
           shouldFallbackCopilotToCodex(providerError);
         if (!canFallback) throw providerError;
         if (verbose) {
@@ -1617,9 +1671,8 @@ async function commandRun(configPath, args, options = {}) {
     console.log(paint("Provider Error Samples", ANSI.bold));
     const sampleErrors = results.filter((row) => row.errored && !row.skippedByProviderFailure).slice(0, 5);
     for (const row of sampleErrors) {
-      console.log(
-        `${labelErr("! provider_error")} ${paint(shortPath(row.filePath), ANSI.bold)} ${labelDim("|")} ${labelErr(row.reason)}`
-      );
+      console.log(`${labelErr("! provider_error")} ${paint(shortPath(row.filePath), ANSI.bold)}`);
+      printWrappedReason(row.reason, labelErr);
     }
     if (erroredCount > sampleErrors.length) {
       console.log(`${labelErr("!")} ... and ${erroredCount - sampleErrors.length} more provider errors`);
@@ -1641,9 +1694,8 @@ async function commandRun(configPath, args, options = {}) {
     console.log(paint("Disposable Candidates", ANSI.bold));
   }
   for (const row of actionable.slice(0, 20)) {
-    console.log(
-      `${labelWarn("-")} ${paint(shortPath(row.filePath), ANSI.bold)} ${labelDim("|")} ${labelInfo(`conf=${row.confidence.toFixed(2)}`)} ${labelDim("|")} ${labelWarn(row.reason || "no reason")}`
-    );
+    console.log(`${labelWarn("-")} ${paint(shortPath(row.filePath), ANSI.bold)} ${labelDim("|")} ${labelInfo(`conf=${row.confidence.toFixed(2)}`)}`);
+    printWrappedReason(row.reason || "no reason", labelWarn);
   }
   if (actionable.length > 20) {
     console.log(`... and ${actionable.length - 20} more`);
@@ -1657,9 +1709,8 @@ async function commandRun(configPath, args, options = {}) {
         : row.confidence < threshold
           ? `kept: confidence ${row.confidence.toFixed(2)} < threshold ${threshold}`
           : "kept: other";
-      console.log(
-        `${labelOk("-")} ${paint(shortPath(row.filePath), ANSI.bold)} ${labelDim("|")} ${labelOk(decision)} ${labelDim("|")} ${labelDim(row.reason || "no reason")}`
-      );
+      console.log(`${labelOk("-")} ${paint(shortPath(row.filePath), ANSI.bold)} ${labelDim("|")} ${labelOk(decision)}`);
+      printWrappedReason(row.reason || "no reason", labelDim);
     }
     if (results.length > 10) {
       console.log(`... and ${results.length - 10} more kept files`);
