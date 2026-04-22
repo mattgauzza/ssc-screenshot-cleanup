@@ -11,6 +11,7 @@ const { pathToFileURL } = require("url");
 const APP_NAME = "screenshot-cleanup";
 const WINDOWS_DEFAULT_FOLDER = path.join(os.homedir(), "Pictures", "Screenshots");
 const DEFAULT_EXTENSIONS = [".png", ".jpg", ".jpeg", ".webp", ".bmp"];
+const SSC_IMPORTANT_ATTR = "ssc_important";
 
 const DEFAULT_CONFIG = {
   defaultFolder:
@@ -24,7 +25,7 @@ const DEFAULT_CONFIG = {
   sortOrder: "newest",
   minFileSizeKB: 10,
   cacheEnabled: true,
-  maxConcurrency: 1,
+  maxConcurrency: 4,
   requestTimeoutMs: 60000,
   provider: "codex",
   providers: {
@@ -257,7 +258,8 @@ async function printHelp(configPath) {
                 [--max-files <n>] [--oldest-first|--newest-first] [--aggressive] [--verbose] [--config <path>]
   ssc schedule install [--time <HH:mm>] [--task-name <name>] [--folder <path>]
                        [--provider codex|copilot] [--model <name>] [--action report|move|delete]
-                       [--max-files <n>] [--oldest-first|--newest-first] [--aggressive] [--verbose] [--config <path>]
+                       [--max-files <n>] [--oldest-first|--newest-first] [--aggressive] [--verbose]
+                       [--start-day auto|today|tomorrow] [--config <path>]
   ssc schedule status [--task-name <name>]
   ssc schedule run-now [--task-name <name>]
   ssc schedule uninstall [--task-name <name>]
@@ -412,6 +414,53 @@ async function fileMeta(filePath) {
 
 function cacheKey(meta) {
   return `${meta.filePath}|${Math.trunc(meta.mtimeMs)}|${meta.size}`;
+}
+
+// Spawn a command and capture its stdout, rejecting on non-zero exit.
+function spawnCapture(cmd, args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    child.stdout.on("data", (d) => { stdout += d; });
+    child.on("close", (code) => {
+      if (code === 0) resolve(stdout.trim());
+      else reject(new Error(`exit ${code}`));
+    });
+    child.on("error", reject);
+  });
+}
+
+// Read ssc_important flag from file metadata (NTFS ADS on Windows, xattr on macOS, getfattr on Linux).
+async function readFileImportantMeta(filePath) {
+  try {
+    if (process.platform === "win32") {
+      const val = await fs.readFile(`${filePath}:${SSC_IMPORTANT_ATTR}`, "utf8");
+      return val.trim() === "true";
+    } else if (process.platform === "darwin") {
+      const val = await spawnCapture("xattr", ["-p", SSC_IMPORTANT_ATTR, filePath]);
+      return val === "true";
+    } else {
+      const val = await spawnCapture("getfattr", ["-n", `user.${SSC_IMPORTANT_ATTR}`, "--only-values", "--absolute-names", filePath]);
+      return val === "true";
+    }
+  } catch {
+    return false;
+  }
+}
+
+// Write ssc_important=true to file metadata. Best-effort — never throws.
+async function writeFileImportantMeta(filePath) {
+  try {
+    if (process.platform === "win32") {
+      await fs.writeFile(`${filePath}:${SSC_IMPORTANT_ATTR}`, "true", "utf8");
+    } else if (process.platform === "darwin") {
+      await spawnCapture("xattr", ["-w", SSC_IMPORTANT_ATTR, "true", filePath]);
+    } else {
+      await spawnCapture("setfattr", ["-n", `user.${SSC_IMPORTANT_ATTR}`, "-v", "true", filePath]);
+    }
+  } catch {
+    // Silently ignore — metadata write is best-effort
+  }
 }
 
 function fillTemplate(tokens, values) {
@@ -902,6 +951,38 @@ function validateTimeHHmm(value) {
   return text;
 }
 
+function parseHHmmToMinutes(time) {
+  const [hours, minutes] = String(time).split(":").map((part) => Number(part));
+  return hours * 60 + minutes;
+}
+
+function formatDateForSchtasks(date) {
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  const year = String(date.getFullYear());
+  return `${month}/${day}/${year}`;
+}
+
+function resolveScheduleStartDate(time, startDayMode) {
+  const mode = String(startDayMode || "auto").toLowerCase();
+  if (!["auto", "today", "tomorrow"].includes(mode)) {
+    throw new Error(`Invalid start day "${startDayMode}". Use auto, today, or tomorrow.`);
+  }
+  const now = new Date();
+  const start = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  if (mode === "today") return start;
+  if (mode === "tomorrow") {
+    start.setDate(start.getDate() + 1);
+    return start;
+  }
+  const nowMinutes = now.getHours() * 60 + now.getMinutes();
+  const targetMinutes = parseHHmmToMinutes(time);
+  if (nowMinutes >= targetMinutes) {
+    start.setDate(start.getDate() + 1);
+  }
+  return start;
+}
+
 function buildScheduleRunArgs(configPath, args) {
   const runArgs = ["run-daily", "--config", configPath];
   const folder = args.folder ? path.resolve(String(args.folder)) : "";
@@ -926,6 +1007,15 @@ async function commandSchedule(configPath, args) {
 
   if (op === "install") {
     const time = validateTimeHHmm(args.time || "09:00");
+    const startDay = String(args["start-day"] || "auto");
+    const startDate = resolveScheduleStartDate(time, startDay);
+    const startDateText = formatDateForSchtasks(startDate);
+    const config = await loadConfig(configPath);
+    if (!config?.daily?.enabled) {
+      config.daily = { ...(config.daily || {}), enabled: true };
+      await writeJson(configPath, config);
+      console.log(`Enabled daily mode in config: ${configPath}`);
+    }
     const runArgs = buildScheduleRunArgs(configPath, args);
     const nodeExe = process.execPath;
     const scriptPath = path.resolve(__filename);
@@ -942,13 +1032,16 @@ async function commandSchedule(configPath, args) {
       "/TR",
       taskRunCommand,
       "/ST",
-      time
+      time,
+      "/SD",
+      startDateText
     ]);
     if (created.code !== 0) {
       throw new Error(`Failed to create scheduled task: ${created.stderr.trim() || created.stdout.trim() || "unknown error"}`);
     }
     console.log(`Scheduled task installed: ${taskName}`);
     console.log(`Time: ${time}`);
+    console.log(`Start date: ${startDateText}`);
     console.log(`Runner script: ${runnerPath}`);
     console.log(`Command: ${taskRunCommand}`);
     return;
@@ -1054,6 +1147,11 @@ function normalizeProvider(value, fallback) {
   if (!v) return fallback;
   if (v === "codex" || v === "copilot") return v;
   return fallback;
+}
+
+function isFreeCopilotModel(modelName) {
+  const normalized = String(modelName || "").trim().toLowerCase().replace(/\s+/g, "-");
+  return normalized === "gpt-5-mini";
 }
 
 function normalizeProviderWithAllowed(value, fallback, allowed) {
@@ -1592,7 +1690,7 @@ async function commandRun(configPath, args, options = {}) {
           : "newest";
   const defaultConcurrency = provider === "copilot" ? 1 : config.maxConcurrency;
   const baseConcurrency = toNumber(args.concurrency, defaultConcurrency);
-  const concurrency = dailyOpts ? 1 : baseConcurrency;
+  const concurrency = baseConcurrency;
   const action = String(args.action || dailyOpts?.action || (aggressive ? "move" : config.action) || "report");
   const dryRun = Boolean(args["dry-run"] || action === "report");
   const force = Boolean(args.force);
@@ -1616,12 +1714,31 @@ async function commandRun(configPath, args, options = {}) {
   });
 
   const metas = await Promise.all(allFiles.map(fileMeta));
-  const filtered = metas
+  const sortedCandidates = metas
     .filter((meta) => meta.size >= minSizeKB * 1024)
-    .sort((a, b) => (sortOrder === "oldest" ? a.mtimeMs - b.mtimeMs : b.mtimeMs - a.mtimeMs))
-    .slice(0, maxFiles);
+    .sort((a, b) => (sortOrder === "oldest" ? a.mtimeMs - b.mtimeMs : b.mtimeMs - a.mtimeMs));
+
+  const importantFlags = await Promise.all(sortedCandidates.map((m) => readFileImportantMeta(m.filePath)));
+
+  let skippedMarkedImportant = 0;
+  const filtered = [];
+  for (let i = 0; i < sortedCandidates.length; i++) {
+    if (importantFlags[i]) {
+      skippedMarkedImportant += 1;
+      continue;
+    }
+    filtered.push(sortedCandidates[i]);
+    if (filtered.length >= maxFiles) break;
+  }
 
   if (!filtered.length) {
+    if (sortedCandidates.length && skippedMarkedImportant > 0) {
+      console.log(
+        `No pending candidates after skipping ${skippedMarkedImportant} already-marked important files.`
+      );
+      console.log("Use --force to reclassify already-reviewed files.");
+      return;
+    }
     console.log("No matching screenshot files found.");
     return;
   }
@@ -1644,7 +1761,9 @@ async function commandRun(configPath, args, options = {}) {
     }
     const key = cacheKey(meta);
     if (config.cacheEnabled && cache[key] && !force) {
-      return { ...meta, ...cache[key], fromCache: true };
+      const cached = cache[key];
+      if (cached.important) await writeFileImportantMeta(meta.filePath);
+      return { ...meta, ...cached, fromCache: true };
     }
     if (dailyOpts?.remainingModelCalls !== undefined && modelCallsUsed >= dailyOpts.remainingModelCalls) {
       return {
@@ -1677,6 +1796,7 @@ async function commandRun(configPath, args, options = {}) {
       }
       const payload = { ...classified, updatedAt: new Date().toISOString() };
       if (config.cacheEnabled) cache[key] = payload;
+      if (payload.important) await writeFileImportantMeta(meta.filePath);
       return { ...meta, ...payload, fromCache: false };
     } catch (error) {
       const providerCommand = String(config.providers?.[provider]?.command || provider);
@@ -1714,6 +1834,9 @@ async function commandRun(configPath, args, options = {}) {
   console.log("");
   console.log(paint("Run Summary", ANSI.bold));
   console.log(`${labelInfo("Scanned:")} ${results.length} files`);
+  if (skippedMarkedImportant) {
+    console.log(`${labelInfo("Skipped (already marked important):")} ${skippedMarkedImportant}`);
+  }
   console.log(`${labelInfo("Provider call attempts:")} ${modelCallsUsed}`);
   console.log(`${labelOk("Important/kept:")} ${important}`);
   console.log(`${labelWarn("Disposable candidates:")} ${disposable.length} ${labelDim(`(threshold=${threshold})`)}`);
@@ -1835,14 +1958,26 @@ async function commandRunDaily(configPath, args) {
   state.days = state.days || {};
   const dayState = state.days[day] || { modelCalls: 0, actions: 0, lastRunAt: null };
 
+  const effectiveProvider = normalizeProvider(args.provider, normalizeProvider(config.provider, "codex"));
+  const effectiveModel = String(
+    args.model || config?.providers?.[effectiveProvider]?.model || ""
+  ).trim();
+  const bypassModelLimit = effectiveProvider === "copilot" && isFreeCopilotModel(effectiveModel);
   const maxModelCallsPerDay = Math.max(0, toNumber(daily.maxModelCallsPerDay, 0));
   const maxActionsPerDay = Math.max(0, toNumber(daily.maxActionsPerDay, 0));
-  const remainingModelCalls = Math.max(0, maxModelCallsPerDay - dayState.modelCalls);
+  const remainingModelCalls = bypassModelLimit
+    ? Number.MAX_SAFE_INTEGER
+    : Math.max(0, maxModelCallsPerDay - dayState.modelCalls);
   const remainingActions = Math.max(0, maxActionsPerDay - dayState.actions);
 
   if (!daily.enabled) {
     console.log("Daily mode disabled in config.daily.enabled.");
     return;
+  }
+  if (bypassModelLimit) {
+    console.log(
+      `Daily model-call cap bypassed for free model: ${effectiveProvider}/${effectiveModel || "unknown-model"}`
+    );
   }
   if (remainingModelCalls <= 0 && remainingActions <= 0) {
     console.log(`Daily budget exhausted for ${day}.`);
@@ -1864,13 +1999,15 @@ async function commandRunDaily(configPath, args) {
     }
   });
 
-  dayState.modelCalls += summary?.modelCallsUsed || 0;
+  if (!bypassModelLimit) {
+    dayState.modelCalls += summary?.modelCallsUsed || 0;
+  }
   dayState.actions += summary?.actionedCount || 0;
   dayState.lastRunAt = new Date().toISOString();
   state.days[day] = dayState;
   await writeJson(dailyStatePath, state);
   console.log(
-    `Daily usage ${day}: modelCalls=${dayState.modelCalls}/${maxModelCallsPerDay}, actions=${dayState.actions}/${maxActionsPerDay}`
+    `Daily usage ${day}: modelCalls=${bypassModelLimit ? "bypassed" : `${dayState.modelCalls}/${maxModelCallsPerDay}`}, actions=${dayState.actions}/${maxActionsPerDay}`
   );
 }
 

@@ -1,6 +1,6 @@
 # SSC Screenshot Cleanup
 
-`ssc` is a Windows-first CLI that classifies screenshots as important vs disposable, then reports, moves, or deletes low-value captures with budget controls.
+`ssc` is a zero-dependency CLI that classifies screenshots as important vs disposable, then reports, moves, or deletes low-value captures with daily budget controls.
 
 ## About This Project
 
@@ -16,9 +16,11 @@ I ain't cleaning all that up myself. Let the CLIs do it! Install ScreenShotClean
 
 - Interactive setup and uninstall: `ssc --install`, `ssc --uninstall`
 - Codex/Copilot provider support with configurable command templates
+- **`ssc_important` file metadata** — files classified as important have `ssc_important=true` embedded directly in their file system metadata (NTFS Alternate Data Streams on Windows, `xattr` on macOS, `getfattr`/`setfattr` on Linux), so the flag travels with the file and survives cache clears
 - Cache by `path + mtime + size` to reduce repeated model calls
 - Daily budget controls for model calls and cleanup actions
 - `--aggressive` mode for more disposable-biased classification
+- Configurable concurrency for parallel provider calls (default: 4; Copilot fixed at 1)
 - Windows Task Scheduler integration: `ssc schedule install|status|run-now|uninstall`
 - Hook shim generation for Codex and Copilot
 
@@ -71,7 +73,8 @@ ssc run-daily [folder] [--provider codex|copilot] [--model <name>] [--action rep
 
 ssc schedule install [--time <HH:mm>] [--task-name <name>] [--folder <path>]
                      [--provider codex|copilot] [--model <name>] [--action report|move|delete]
-                     [--max-files <n>] [--oldest-first|--newest-first] [--aggressive] [--verbose] [--config <path>]
+                     [--max-files <n>] [--oldest-first|--newest-first] [--aggressive] [--verbose]
+                     [--start-day auto|today|tomorrow] [--config <path>]
 ssc schedule status [--task-name <name>]
 ssc schedule run-now [--task-name <name>]
 ssc schedule uninstall [--task-name <name>]
@@ -93,11 +96,15 @@ ssc help
 - `ssc run` defaults to report mode unless `--action move|delete` is set.
 - `ssc run` requires `--yes` for file-changing actions.
 - `ssc run` uses `sortOrder` from config unless overridden by `--oldest-first` or `--newest-first`.
+- Files previously classified as `important=true` have `ssc_important=true` written into their file system metadata. On every subsequent run these files are detected and skipped **before** entering the candidate window, so repeated runs continue progressing through older files without re-spending model calls on already-reviewed screenshots.
+- The `important` metadata flag is stored in the file itself (not only in `cache.json`), so it survives cache clears and persists even if config is moved.
 - `ssc run-daily` enforces `daily.maxModelCallsPerDay` and `daily.maxActionsPerDay`.
+- `ssc run-daily` bypasses `daily.maxModelCallsPerDay` when provider/model is `copilot` + `gpt-5-mini` (free tier), while still enforcing `daily.maxActionsPerDay`.
 - `ssc run-daily` auto-confirms move/delete when daily action is set to `move` or `delete`.
-- `--force` bypasses cache and reclassifies files.
+- `--force` bypasses both the result cache and file metadata, reclassifying every candidate from scratch.
 - `--verbose` prints provider commands and (if present) sampled provider error reasons.
 - For Copilot image runs in compatibility mode, verbose output masks prompt text as `-p <prompt>`.
+- Provider calls run in parallel up to `maxConcurrency` (default: 4). Copilot is always capped at 1 since it is a CLI wrapper.
 
 ## Aggressive Mode
 
@@ -116,13 +123,21 @@ If you want the lowest-cost routine profile, use Copilot with `gpt-5-mini`.
 ssc config set providers.copilot.enabled true
 ssc config set provider copilot
 ssc config set providers.copilot.model gpt-5-mini
+ssc config set sortOrder oldest
 ssc config set daily.sortOrder oldest
-ssc config set daily.action move
-ssc config set daily.maxModelCallsPerDay 8
-ssc config set daily.maxActionsPerDay 8
+ssc config set daily.action delete
+ssc config set daily.maxModelCallsPerDay 20
+ssc config set daily.maxActionsPerDay 20
 ```
 
-Optional dry-run check:
+Then install the daily scheduler:
+
+```powershell
+ssc schedule install --time 09:00 --provider copilot --model gpt-5-mini --action delete --max-files 20 --oldest-first
+ssc schedule status
+```
+
+Optional dry-run check before committing to deletions:
 
 ```powershell
 ssc run --provider copilot --model gpt-5-mini --oldest-first --action report --max-files 25 --force --verbose
@@ -185,6 +200,8 @@ Notes:
 - Scheduler commands are Windows-only.
 - Default task name: `SSC Screenshot Cleanup Daily`
 - `--time` must be `HH:mm` (24-hour format)
+- `--start-day auto` starts today if the time has not passed yet, otherwise starts tomorrow
+- `schedule install` auto-enables `daily.enabled` in config when it is currently false
 - `run-now` requires the task to exist (install first)
 
 ## Configuration
@@ -199,7 +216,19 @@ Other files:
 - Daily usage state: `%APPDATA%\screenshot-cleanup\daily-state.json`
 - Install manifest: `%APPDATA%\screenshot-cleanup\install-manifest.json`
 
-Useful keys:
+### `ssc_important` file metadata
+
+When a file is classified as `important=true`, SSC writes a `ssc_important=true` flag directly into the file's metadata:
+
+| Platform | Storage mechanism | Written as |
+|----------|------------------|------------|
+| Windows  | NTFS Alternate Data Stream | `<file>:ssc_important` |
+| macOS    | Extended attribute (`xattr`) | `xattr -w ssc_important true <file>` |
+| Linux    | Extended attribute (`getfattr`/`setfattr`) | `user.ssc_important=true` |
+
+This flag is checked before any provider calls are made, so already-reviewed important files are silently skipped every run at zero cost. Use `--force` to override and reclassify them anyway.
+
+### Useful config keys
 
 - `defaultFolder`
 - `sortOrder`
